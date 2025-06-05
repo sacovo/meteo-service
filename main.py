@@ -45,7 +45,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"Refresh interval: {config.server.refresh_interval_minutes} minutes")
 
     # Create cache directory if it doesn't exist
-    cache_dir = "/app/cache"
+    cache_dir = ".cache"
     if not os.path.exists(cache_dir):
         os.makedirs(cache_dir, exist_ok=True)
         logger.info(f"Created cache directory: {cache_dir}")

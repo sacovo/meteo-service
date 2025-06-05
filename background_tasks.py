@@ -1,4 +1,5 @@
 import asyncio
+import gc  # Import garbage collector
 import logging
 from datetime import datetime, timezone
 
@@ -29,28 +30,33 @@ class WeatherUpdateTask:
                 await self.update_all_locations()
 
     async def update_all_locations(self):
-        """Update weather data for all configured locations."""
+        """Update weather data for all configured locations, one at a time to minimize memory usage."""
+
         logger.info("Updating weather data for all locations")
 
         reference_time = datetime.now(timezone.utc).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
 
-        tasks = []
-        for slug, location in self.config.locations.items():
-            task = self.update_location(slug, location, reference_time)
-            tasks.append(task)
-
-        # Update all locations concurrently
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Log results
-        for i, result in enumerate(results):
-            slug = list(self.config.locations.keys())[i]
-            if isinstance(result, Exception):
-                logger.error(f"Failed to update {slug}: {result}")
-            else:
+        # Process locations one at a time to limit memory usage
+        locations = list(self.config.locations.items())
+        logger.info(f"Processing {len(locations)} locations sequentially to save memory")
+        
+        for slug, location in locations:
+            try:
+                logger.info(f"Processing location: {slug}")
+                await self.update_location(slug, location, reference_time)
                 logger.info(f"Successfully updated {slug}")
+            except Exception as e:
+                logger.error(f"Failed to update {slug}: {e}")
+            
+            # Force garbage collection after each location
+            collected = gc.collect()
+            logger.info(f"Garbage collection after {slug}: {collected} objects collected")
+        
+        # Run a final round of garbage collection
+        collected = gc.collect()
+        logger.info(f"Final garbage collection completed: {collected} objects collected")
 
     async def update_location(self, slug: str, location, reference_time: datetime):
         """Update weather data for a single location."""
@@ -62,6 +68,9 @@ class WeatherUpdateTask:
         except Exception as e:
             logger.error(f"Error updating {slug}: {e}")
             raise
+        finally:
+            collected = gc.collect()
+            logger.info(f"Garbage collection completed: {collected} objects collected")
 
     def stop(self):
         """Stop the background update task."""

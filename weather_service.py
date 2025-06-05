@@ -32,6 +32,7 @@ class WeatherService:
         """
         Get weather forecast for a specific location.
         """
+        # Using a separate function to ensure proper cleanup
         try:
             logger.info(f"Fetching weather data for {slug} ({location.name})")
 
@@ -49,31 +50,9 @@ class WeatherService:
                 "ymax": location.ymax,
             }
 
-            # Get weather data
-            weather_data = await self._fetch_weather_data(
-                bbox, hours_ahead, reference_time
-            )
-
-            # Process into hourly format
-            hourly_data = self._process_hourly_data(
-                weather_data["temperature_data"],
-                weather_data["precipitation_data"],
-                reference_time,
-            )
-
-            # Calculate summary statistics
-            summary = self._calculate_summary(hourly_data)
-
-            # Create forecast object
-            forecast = WeatherForecast(
-                location_slug=slug,
-                location_name=location.name,
-                reference_time=reference_time,
-                last_updated=datetime.now(timezone.utc),
-                forecast_hours=hours_ahead,
-                bounding_box=bbox,
-                hourly_data=hourly_data,
-                summary=summary,
+            # Process one batch at a time to minimize memory usage
+            forecast = await self._process_location_data(
+                slug, location.name, bbox, hours_ahead, reference_time
             )
 
             logger.info(f"Successfully fetched weather data for {slug}")
@@ -82,13 +61,77 @@ class WeatherService:
         except Exception as e:
             logger.error(f"Error fetching weather data for {slug}: {e}")
             raise
+            
+    async def _process_location_data(
+        self,
+        slug: str,
+        location_name: str,
+        bbox: Dict[str, float],
+        hours_ahead: int,
+        reference_time: datetime,
+    ) -> WeatherForecast:
+        """
+        Process weather data for a location, ensuring memory is released.
+        """
+        temp_data = None
+        precip_data = None
+        hourly_data = []
+        
+        try:
+            # Get weather data
+            weather_data = await self._fetch_weather_data(
+                bbox, hours_ahead, reference_time
+            )
+            
+            temp_data = weather_data["temperature_data"]
+            precip_data = weather_data["precipitation_data"]
+
+            # Process into hourly format - extract data and release immediately
+            hourly_data = self._process_hourly_data(
+                temp_data,
+                precip_data,
+                reference_time,
+            )
+
+            # Calculate summary statistics
+            summary = self._calculate_summary(hourly_data)
+
+            # Create forecast object with the extracted data
+            forecast = WeatherForecast(
+                location_slug=slug,
+                location_name=location_name,
+                reference_time=reference_time,
+                last_updated=datetime.now(timezone.utc),
+                forecast_hours=hours_ahead,
+                bounding_box=bbox,
+                hourly_data=hourly_data,
+                summary=summary,
+            )
+            
+            return forecast
+            
+        finally:
+            # Aggressively close and clean up all data
+            if temp_data is not None and hasattr(temp_data, 'close'):
+                temp_data.close()
+                temp_data = None
+            
+            if precip_data is not None and hasattr(precip_data, 'close'):
+                precip_data.close()
+                precip_data = None
+                
+            # Force garbage collection to clean up any remaining data
+            import gc
+            gc.collect()
 
     async def _fetch_weather_data(
         self, bbox: Dict[str, float], hours_ahead: int, reference_time: datetime
     ) -> Dict:
         """
-        Fetch raw weather data from the API.
+        Fetch raw weather data from the API, with aggressive memory management.
         """
+        import gc  # Import garbage collector
+        
         # Create requests for both temperature and precipitation
         temp_requests = []
         precip_requests = []
@@ -114,46 +157,113 @@ class WeatherService:
             )
             precip_requests.append(precip_req)
 
-        # Retrieve temperature data
         temp_data_list = []
-        for req in temp_requests:
-            da = ogd_api.get_from_ogd(req)
-            temp_data_list.append(da)
-
-        # Retrieve precipitation data
         precip_data_list = []
-        for req in precip_requests:
-            da = ogd_api.get_from_ogd(req)
-            precip_data_list.append(da)
+        temp_data = None
+        precip_data = None
+        precip_hourly = None
+        temp_regridded = None
+        precip_regridded = None
+        
+        try:
+            # Retrieve temperature data in batches and process immediately
+            logger.info(f"Fetching {len(temp_requests)} temperature requests")
+            for req in temp_requests:
+                da = ogd_api.get_from_ogd(req)
+                temp_data_list.append(da)
 
-        # Merge data arrays
-        temp_data = xr.concat(temp_data_list, dim="lead_time")
-        precip_data = xr.concat(precip_data_list, dim="lead_time")
+            # Retrieve precipitation data in batches
+            logger.info(f"Fetching {len(precip_requests)} precipitation requests")
+            for req in precip_requests:
+                da = ogd_api.get_from_ogd(req)
+                precip_data_list.append(da)
 
-        # Convert precipitation to hourly values (deaccumulate)
-        precip_hourly = time_ops.delta(precip_data, np.timedelta64(1, "h"))
+            # Merge data arrays
+            logger.info("Merging data arrays")
+            temp_data = xr.concat(temp_data_list, dim="lead_time")
+            precip_data = xr.concat(precip_data_list, dim="lead_time")
+            
+            # Clear lists to free memory
+            for da in temp_data_list:
+                if hasattr(da, "close"):
+                    da.close()
+            temp_data_list = []
+            
+            for da in precip_data_list:
+                if hasattr(da, "close"):
+                    da.close()
+            precip_data_list = []
+            
+            # Run garbage collection after clearing lists
+            gc.collect()
 
-        # Define target grid for the bounding box
-        xmin, xmax = bbox["xmin"], bbox["xmax"]
-        ymin, ymax = bbox["ymin"], bbox["ymax"]
+            # Convert precipitation to hourly values (deaccumulate)
+            logger.info("Processing precipitation data")
+            precip_hourly = time_ops.delta(precip_data, np.timedelta64(1, "h"))
+            
+            # Close precipitation data as soon as we're done with it
+            if hasattr(precip_data, 'close'):
+                precip_data.close()
+                precip_data = None
+                gc.collect()  # Run garbage collection
 
-        # Calculate grid resolution
-        nx = max(int((xmax - xmin) * 111.32 / 2), 10)
-        ny = max(int((ymax - ymin) * 111.32 / 2), 10)
+            # Define target grid for the bounding box
+            xmin, xmax = bbox["xmin"], bbox["xmax"]
+            ymin, ymax = bbox["ymin"], bbox["ymax"]
 
-        # Create target grid
-        destination = regrid.RegularGrid(
-            CRS.from_string("epsg:4326"), nx, ny, xmin, xmax, ymin, ymax
-        )
+            # Calculate grid resolution
+            nx = max(int((xmax - xmin) * 111.32 / 2), 10)
+            ny = max(int((ymax - ymin) * 111.32 / 2), 10)
 
-        # Regrid data to regular lat/lon grid
-        temp_regridded = regrid.iconremap(temp_data, destination)
-        precip_regridded = regrid.iconremap(precip_hourly, destination)
+            # Create target grid
+            logger.info("Creating regridding destination")
+            destination = regrid.RegularGrid(
+                CRS.from_string("epsg:4326"), nx, ny, xmin, xmax, ymin, ymax
+            )
 
-        return {
-            "temperature_data": temp_regridded,
-            "precipitation_data": precip_regridded,
-        }
+            # Regrid data to regular lat/lon grid one at a time
+            logger.info("Regridding temperature data")
+            temp_regridded = regrid.iconremap(temp_data, destination)
+            
+            # Close temperature data after regridding
+            if hasattr(temp_data, 'close'):
+                temp_data.close()
+                temp_data = None
+                gc.collect()  # Run garbage collection
+            
+            logger.info("Regridding precipitation data")
+            precip_regridded = regrid.iconremap(precip_hourly, destination)
+            
+            # Close precipitation hourly data after regridding
+            if hasattr(precip_hourly, 'close'):
+                precip_hourly.close()
+                precip_hourly = None
+                gc.collect()  # Run garbage collection
+
+            return {
+                "temperature_data": temp_regridded,
+                "precipitation_data": precip_regridded,
+            }
+        except Exception as e:
+            logger.error(f"Error in _fetch_weather_data: {e}")
+            raise
+        finally:
+            # Explicitly close all data arrays to prevent memory leaks
+            for da in temp_data_list:
+                if hasattr(da, "close"):
+                    da.close()
+            
+            for da in precip_data_list:
+                if hasattr(da, "close"):
+                    da.close()
+            
+            # Close all data objects
+            for data_obj in [temp_data, precip_data, precip_hourly]:
+                if data_obj is not None and hasattr(data_obj, 'close'):
+                    data_obj.close()
+                    
+            # Run a final garbage collection
+            gc.collect()
 
     def _process_hourly_data(
         self,
@@ -162,27 +272,33 @@ class WeatherService:
         reference_time: datetime,
     ) -> List[HourlyWeatherData]:
         """
-        Process raw data into hourly format.
+        Process raw data into hourly format with careful memory management.
         """
+        import gc  # Import garbage collector
         hourly_data = []
 
+        # Get lead times once
+        lead_times = [int(lt.astype("timedelta64[h]").astype(int)) for lt in temp_data.lead_time.values]
+        
         # Skip first hour for precipitation (no delta available)
-        for i in range(1, len(temp_data.lead_time)):
-            lead_time_hours = int(
-                temp_data.lead_time.values[i].astype("timedelta64[h]").astype(int)
-            )
+        for i in range(1, len(lead_times)):
+            lead_time_hours = lead_times[i]
             hour_datetime = reference_time + timedelta(hours=lead_time_hours)
 
-            # Temperature data (convert from Kelvin to Celsius)
-            temp_slice = temp_data.isel(lead_time=i) - 273.15
-            temp_min = float(temp_slice.min().values)
-            temp_max = float(temp_slice.max().values)
-            temp_mean = float(temp_slice.mean().values)
+            # Extract temperature data (convert from Kelvin to Celsius) in isolated blocks
+            with temp_data.isel(lead_time=i) as temp_slice:
+                temp_slice_celsius = temp_slice - 273.15
+                temp_min = float(temp_slice_celsius.min().values)
+                temp_max = float(temp_slice_celsius.max().values)
+                temp_mean = float(temp_slice_celsius.mean().values)
+                # Let temp_slice go out of scope
 
-            # Precipitation data (mm/h)
-            precip_slice = precip_data.isel(lead_time=i)
-            precip_max = float(precip_slice.max().values)
+            # Extract precipitation data (mm/h) in isolated blocks
+            with precip_data.isel(lead_time=i) as precip_slice:
+                precip_max = float(precip_slice.max().values)
+                # Let precip_slice go out of scope
 
+            # Create hourly data object with extracted scalar values
             hourly_data.append(
                 HourlyWeatherData(
                     hour=lead_time_hours,
@@ -193,6 +309,10 @@ class WeatherService:
                     precipitation=round(precip_max, 2),
                 )
             )
+            
+            # Run garbage collection every 5 hours to keep memory usage low
+            if i % 5 == 0:
+                gc.collect()
 
         return hourly_data
 
