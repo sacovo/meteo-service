@@ -26,7 +26,7 @@ class WeatherService:
         self,
         slug: str,
         location: LocationConfig,
-        hours_ahead: int = 24,
+        hours_ahead: int = 48,
         reference_time: Optional[datetime] = None,
     ) -> WeatherForecast:
         """
@@ -37,7 +37,9 @@ class WeatherService:
 
             # Set default reference time if not provided
             if reference_time is None:
-                reference_time = datetime.now(timezone.utc)
+                reference_time = datetime.now(timezone.utc).replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                )
 
             # Create bounding box dict
             bbox = {

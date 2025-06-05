@@ -32,7 +32,9 @@ class WeatherUpdateTask:
         """Update weather data for all configured locations."""
         logger.info("Updating weather data for all locations")
 
-        reference_time = datetime.now(timezone.utc)
+        reference_time = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
 
         tasks = []
         for slug, location in self.config.locations.items():
