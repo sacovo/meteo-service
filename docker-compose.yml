@@ -1,0 +1,29 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./config.toml:/app/config.toml:ro
+      - weather-cache:/app/cache
+    environment:
+      - PYTHONPATH=/app
+      - EARTHKIT_CACHE_DIR=/app/cache
+      - LOG_LEVEL=INFO
+      - WORKERS=2
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 30s
+      retries: 3
+      start_period: 120s  # Longer startup time for production
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+volumes:
+  weather-cache:
+    driver: local   
