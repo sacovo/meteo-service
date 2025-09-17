@@ -1,4 +1,7 @@
 import logging
+import os
+import shutil
+import tempfile
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
@@ -21,6 +24,20 @@ logger = logging.getLogger(__name__)
 class WeatherService:
     def __init__(self):
         self.cached_forecasts: Dict[str, WeatherForecast] = {}
+        self.temp_cache_dir = tempfile.mkdtemp(prefix="weather_cache_")
+        config.set("cache-directory", self.temp_cache_dir)
+        config.set("cache-policy", "user")
+
+    def clear_earthkit_cache(self):
+        """Clear the earthkit cache directory."""
+        try:
+            if os.path.exists(self.temp_cache_dir):
+                shutil.rmtree(self.temp_cache_dir)
+                # Recreate the directory
+                os.makedirs(self.temp_cache_dir, exist_ok=True)
+                logger.info("Cleared earthkit cache directory")
+        except Exception as e:
+            logger.warning(f"Could not clear earthkit cache: {e}")
 
     async def get_forecast_for_location(
         self,
@@ -61,7 +78,7 @@ class WeatherService:
         except Exception as e:
             logger.error(f"Error fetching weather data for {slug}: {e}")
             raise
-            
+
     async def _process_location_data(
         self,
         slug: str,
@@ -76,13 +93,13 @@ class WeatherService:
         temp_data = None
         precip_data = None
         hourly_data = []
-        
+
         try:
             # Get weather data
             weather_data = await self._fetch_weather_data(
                 bbox, hours_ahead, reference_time
             )
-            
+
             temp_data = weather_data["temperature_data"]
             precip_data = weather_data["precipitation_data"]
 
@@ -107,22 +124,25 @@ class WeatherService:
                 hourly_data=hourly_data,
                 summary=summary,
             )
-            
+
             return forecast
-            
+
         finally:
             # Aggressively close and clean up all data
-            if temp_data is not None and hasattr(temp_data, 'close'):
+            if temp_data is not None and hasattr(temp_data, "close"):
                 temp_data.close()
                 temp_data = None
-            
-            if precip_data is not None and hasattr(precip_data, 'close'):
+
+            if precip_data is not None and hasattr(precip_data, "close"):
                 precip_data.close()
                 precip_data = None
-                
+
             # Force garbage collection to clean up any remaining data
             import gc
+
             gc.collect()
+            # Clear earthkit data after processing
+            self.clear_earthkit_cache()
 
     async def _fetch_weather_data(
         self, bbox: Dict[str, float], hours_ahead: int, reference_time: datetime
@@ -131,7 +151,7 @@ class WeatherService:
         Fetch raw weather data from the API, with aggressive memory management.
         """
         import gc  # Import garbage collector
-        
+
         # Create requests for both temperature and precipitation
         temp_requests = []
         precip_requests = []
@@ -164,7 +184,7 @@ class WeatherService:
         precip_hourly = None
         temp_regridded = None
         precip_regridded = None
-        
+
         try:
             # Retrieve temperature data in batches and process immediately
             logger.info(f"Fetching {len(temp_requests)} temperature requests")
@@ -182,27 +202,27 @@ class WeatherService:
             logger.info("Merging data arrays")
             temp_data = xr.concat(temp_data_list, dim="lead_time")
             precip_data = xr.concat(precip_data_list, dim="lead_time")
-            
+
             # Clear lists to free memory
             for da in temp_data_list:
                 if hasattr(da, "close"):
                     da.close()
             temp_data_list = []
-            
+
             for da in precip_data_list:
                 if hasattr(da, "close"):
                     da.close()
             precip_data_list = []
-            
+
             # Run garbage collection after clearing lists
             gc.collect()
 
             # Convert precipitation to hourly values (deaccumulate)
             logger.info("Processing precipitation data")
             precip_hourly = time_ops.delta(precip_data, np.timedelta64(1, "h"))
-            
+
             # Close precipitation data as soon as we're done with it
-            if hasattr(precip_data, 'close'):
+            if hasattr(precip_data, "close"):
                 precip_data.close()
                 precip_data = None
                 gc.collect()  # Run garbage collection
@@ -224,18 +244,18 @@ class WeatherService:
             # Regrid data to regular lat/lon grid one at a time
             logger.info("Regridding temperature data")
             temp_regridded = regrid.iconremap(temp_data, destination)
-            
+
             # Close temperature data after regridding
-            if hasattr(temp_data, 'close'):
+            if hasattr(temp_data, "close"):
                 temp_data.close()
                 temp_data = None
                 gc.collect()  # Run garbage collection
-            
+
             logger.info("Regridding precipitation data")
             precip_regridded = regrid.iconremap(precip_hourly, destination)
-            
+
             # Close precipitation hourly data after regridding
-            if hasattr(precip_hourly, 'close'):
+            if hasattr(precip_hourly, "close"):
                 precip_hourly.close()
                 precip_hourly = None
                 gc.collect()  # Run garbage collection
@@ -252,16 +272,16 @@ class WeatherService:
             for da in temp_data_list:
                 if hasattr(da, "close"):
                     da.close()
-            
+
             for da in precip_data_list:
                 if hasattr(da, "close"):
                     da.close()
-            
+
             # Close all data objects
             for data_obj in [temp_data, precip_data, precip_hourly]:
-                if data_obj is not None and hasattr(data_obj, 'close'):
+                if data_obj is not None and hasattr(data_obj, "close"):
                     data_obj.close()
-                    
+
             # Run a final garbage collection
             gc.collect()
 
@@ -275,11 +295,15 @@ class WeatherService:
         Process raw data into hourly format with careful memory management.
         """
         import gc  # Import garbage collector
+
         hourly_data = []
 
         # Get lead times once
-        lead_times = [int(lt.astype("timedelta64[h]").astype(int)) for lt in temp_data.lead_time.values]
-        
+        lead_times = [
+            int(lt.astype("timedelta64[h]").astype(int))
+            for lt in temp_data.lead_time.values
+        ]
+
         # Skip first hour for precipitation (no delta available)
         for i in range(1, len(lead_times)):
             lead_time_hours = lead_times[i]
@@ -309,7 +333,7 @@ class WeatherService:
                     precipitation=round(precip_max, 2),
                 )
             )
-            
+
             # Run garbage collection every 5 hours to keep memory usage low
             if i % 5 == 0:
                 gc.collect()
